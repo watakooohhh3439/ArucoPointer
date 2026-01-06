@@ -1,61 +1,69 @@
 ﻿using OpenCvSharp;
+using OpenCvSharp.Aruco;
+using OpenCvSharp.Extensions;
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Drawing;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using OpenCvSharp.Extensions;
-using OpenCvSharp.Aruco;
 
 namespace ArucoPointer
 {
     public partial class Form1 : Form
     {
-        
+        // ==========================================
+        // クラスのメンバ変数（状態を保存しておく場所）
+        // ==========================================
+
+        // キャリブレーション用のデータをためておくリスト
         List<Mat> collectedRvecs = new List<Mat>(); // 回転データ
         List<Mat> collectedTvecs = new List<Mat>(); // 位置データ
-        bool isCalibrating = false; // キャリブレーション中かどうか
-        int collectCount = 0; // 集めた数
 
-        Mat calibratedOffset = null; // 計算されたオフセットをここに保存
+        bool isCalibrating = false; // 今、データ収集中かどうか？
+        int collectCount = 0;       // 何個データが集まったか？
+
+        Mat calibratedOffset = null; // 計算で求めた「先端のオフセット」を保存する場所
 
         public Form1()
         {
             InitializeComponent();
         }
 
+        // ==========================================
+        // イベントハンドラ（ボタン操作など）
+        // ==========================================
+
+        // ボタン1：カメラを起動する
         private void button1_Click(object sender, EventArgs e)
         {
             MessageBox.Show("カメラを起動します！");
+            // 重い処理なのでワーカースレッド（別作業員）に任せる
             Task.Run(() => CameraLoop());
         }
 
+        // ボタン2：キャリブレーション（データ収集）を開始する
         private void button2_Click(object sender, EventArgs e)
         {
-            // ここで変数を触ってもエラーにならなくなります
+            // 変数をリセットして収集モードON
             collectedRvecs.Clear();
             collectedTvecs.Clear();
             collectCount = 0;
             isCalibrating = true;
-            MessageBox.Show("先端を固定して、指示棒を回しながらデータを集めます。\nOKを押すと開始します。");
+            MessageBox.Show("先端を固定して、指示棒を回しながらデータを集めます。\nOKを押すと開始します。(20個集めます)");
         }
 
+        // ==========================================
+        // メイン処理（カメラ映像のループ）
+        // ==========================================
         private void CameraLoop()
         {
             // パラメータ設定
-            double fx = 600;
-            double cx = 320;
-            double cy = 240;
-            float markerLength = 0.014f;
+            float markerLength = 0.015f; // マーカーサイズ(m)
+            double fx = 600, cx = 320, cy = 240;
 
             using (var cameraMatrix = new Mat(3, 3, MatType.CV_64FC1))
             using (var distCoeffs = new Mat(5, 1, MatType.CV_64FC1, new Scalar(0)))
-            using (var capture = new VideoCapture(1))
+            using (var capture = new VideoCapture(1)) // カメラ番号
             {
                 cameraMatrix.Set<double>(0, 0, fx);
                 cameraMatrix.Set<double>(0, 1, 0);
@@ -66,6 +74,10 @@ namespace ArucoPointer
                 cameraMatrix.Set<double>(2, 0, 0);
                 cameraMatrix.Set<double>(2, 1, 0);
                 cameraMatrix.Set<double>(2, 2, 1.0);
+
+                // iVCamなどの高解像度対策
+                capture.Set(VideoCaptureProperties.FrameWidth, 640);
+                capture.Set(VideoCaptureProperties.FrameHeight, 480);
 
                 if (!capture.IsOpened())
                 {
@@ -80,70 +92,69 @@ namespace ArucoPointer
 
                     while (true)
                     {
-                        capture.Read(mat);
-                        if (mat.Empty()) continue;
-
-                        CvAruco.DetectMarkers(mat, dictionary, out var corners, out var ids, parameters, out var rejected);
-
-                        if (ids.Length > 0)
+                        try
                         {
-                            CvAruco.DrawDetectedMarkers(mat, corners, ids);
+                            capture.Read(mat);
+                            if (mat.Empty()) continue;
 
-                            using (var rvecs = new Mat())
-                            using (var tvecs = new Mat())
+                            CvAruco.DetectMarkers(mat, dictionary, out var corners, out var ids, parameters, out var rejected);
+
+                            if (ids.Length > 0)
                             {
-                                CvAruco.EstimatePoseSingleMarkers(corners, markerLength, cameraMatrix, distCoeffs, rvecs, tvecs);
+                                CvAruco.DrawDetectedMarkers(mat, corners, ids);
 
-                                for (int i = 0; i < ids.Length; i++)
+                                using (var rvecs = new Mat())
+                                using (var tvecs = new Mat())
                                 {
-                                    Cv2.DrawFrameAxes(mat, cameraMatrix, distCoeffs, rvecs.Row(i), tvecs.Row(i), 0.1f);
-                                }
+                                    CvAruco.EstimatePoseSingleMarkers(corners, markerLength, cameraMatrix, distCoeffs, rvecs, tvecs);
 
-                                // ★修正ポイント2：rvecsが生きているこのブロックの中に処理を入れる！
-                                if (isCalibrating)
-                                {
-                                    // データをコピーして保存
-                                    collectedRvecs.Add(rvecs.Row(0).Clone());
-                                    collectedTvecs.Add(tvecs.Row(0).Clone());
-                                    collectCount++;
-
-                                    Console.WriteLine($"データ収集中... {collectCount}/20");
-
-                                    // 20個たまったら終了
-                                    if (collectCount >= 20)
+                                    for (int i = 0; i < ids.Length; i++)
                                     {
-                                        isCalibrating = false;
+                                        Cv2.DrawFrameAxes(mat, cameraMatrix, distCoeffs, rvecs.Row(i), tvecs.Row(i), 0.1f);
+                                    }
 
-                                        // ★計算を実行！
-                                        try
+                                    // --- データ収集 ---
+                                    if (isCalibrating)
+                                    {
+                                        // 安全にコピーして保存
+                                        using (var rRow = rvecs.Row(0))
+                                        using (var tRow = tvecs.Row(0))
                                         {
+                                            collectedRvecs.Add(rRow.Clone());
+                                            collectedTvecs.Add(tRow.Clone());
+                                        }
+                                        collectCount++;
+                                        Console.WriteLine($"データ収集中... {collectCount}/20");
+
+                                        if (collectCount >= 20)
+                                        {
+                                            isCalibrating = false;
                                             calibratedOffset = CalculatePivot(collectedRvecs, collectedTvecs);
 
-                                            // 結果を表示してみる (メートル単位)
+                                            // 計算結果の表示
                                             double x = calibratedOffset.At<double>(0);
                                             double y = calibratedOffset.At<double>(1);
                                             double z = calibratedOffset.At<double>(2);
-
-                                            MessageBox.Show($"キャリブレーション完了！\nオフセット:\nX: {x:F3}\nY: {y:F3}\nZ: {z:F3}");
+                                            MessageBox.Show($"完了！\nOffset: {x:F3}, {y:F3}, {z:F3}");
                                         }
-                                        catch (Exception ex)
-                                        {
-                                            MessageBox.Show("計算エラー: " + ex.Message);
-                                        }
+                                        Thread.Sleep(100);
                                     }
 
-                                    // データの偏りを防ぐため待機
-                                    Thread.Sleep(100);
+                                    // ★ここに赤い丸を描く処理がありましたが、削除しました
                                 }
-                            } // ← rvecs, tvecs はここで寿命が終わります
-                        }
+                            }
 
-                        pictureBox1.Invoke((Action)(() =>
+                            pictureBox1.Invoke((Action)(() =>
+                            {
+                                var oldImage = pictureBox1.Image;
+                                pictureBox1.Image = BitmapConverter.ToBitmap(mat);
+                                if (oldImage != null) oldImage.Dispose();
+                            }));
+                        }
+                        catch (Exception ex)
                         {
-                            var oldImage = pictureBox1.Image;
-                            pictureBox1.Image = BitmapConverter.ToBitmap(mat);
-                            if (oldImage != null) oldImage.Dispose();
-                        }));
+                            Console.WriteLine("Loop Error: " + ex.Message);
+                        }
 
                         Thread.Sleep(30);
                     }
@@ -151,60 +162,70 @@ namespace ArucoPointer
             }
         }
 
-        // ★これをクラス内（CameraLoopの下など）に追加してください
+        // ==========================================
+        // 計算ロジック（ピボットキャリブレーション）
+        // ==========================================
         private Mat CalculatePivot(List<Mat> rvecs, List<Mat> tvecs)
         {
             int count = rvecs.Count;
+            int rows = count * 3;
 
-            // 行列 A と B を用意
-            using (var A = new Mat())
-            using (var B = new Mat())
+            // 最初からDouble型で大きな箱を用意（エラー回避のため）
+            using (var A = new Mat(rows, 6, MatType.CV_64FC1))
+            using (var B = new Mat(rows, 1, MatType.CV_64FC1))
             {
                 for (int i = 0; i < count; i++)
                 {
-                    // 1. 回転ベクトル(rvec)を回転行列(3x3)に変換
-                    using (var R = new Mat())
+                    // --- 行列 A の作成 ---
                     using (var rvecDouble = new Mat())
+                    using (var R = new Mat())
                     {
-                        // 型をDoubleに揃える（エラー防止）
-                        rvecs[i].ConvertTo(rvecDouble, MatType.CV_64FC1);
+                        // ★Reshape(1)を追加：データを正しく取り出す
+                        using (var rvecReshaped = rvecs[i].Reshape(1))
+                        {
+                            rvecReshaped.ConvertTo(rvecDouble, MatType.CV_64FC1);
+                        }
+
                         Cv2.Rodrigues(rvecDouble, R);
 
-                        // 2. -I (マイナス単位行列) を作成
-                        using (var negI = -Mat.Eye(3, 3, MatType.CV_64FC1))
-                        using (var rowA = new Mat())
+                        using (var eye = Mat.Eye(3, 3, MatType.CV_64FC1))
+                        using (var negI = (eye * -1).ToMat())
+                        using (var blockA = new Mat())
                         {
-                            // 3. [R, -I] という横長の行列(3x6)を作る
-                            Cv2.HConcat(new Mat[] { R, negI }, rowA);
-
-                            // Aに追加 (縦に積む)
-                            A.PushBack(rowA);
+                            Cv2.HConcat(new Mat[] { R, negI }, blockA);
+                            using (var targetRow = A.RowRange(i * 3, i * 3 + 3))
+                            {
+                                blockA.CopyTo(targetRow);
+                            }
                         }
                     }
 
-                    // 4. Bに -T を追加 (縦に積む)
-                    // ★ここが修正ポイント！
-                    // tvecs[i] は「1x3（横長）」なので、「3x1（縦長）」に転置(.T())してから計算に追加します。
+                    // --- 行列 B の作成 ---
                     using (var tvecDouble = new Mat())
                     {
-                        tvecs[i].ConvertTo(tvecDouble, MatType.CV_64FC1); // 型をDoubleに
-                        using (var T_transposed = tvecDouble.T()) // 転置！
-                        using (var negT = -T_transposed)
+                        // ★Reshape(1)を追加
+                        using (var tvecReshaped = tvecs[i].Reshape(1))
                         {
-                            B.PushBack(negT);
+                            tvecReshaped.ConvertTo(tvecDouble, MatType.CV_64FC1);
+                        }
+
+                        using (var trans = tvecDouble.T().ToMat())
+                        using (var negT = (trans * -1).ToMat())
+                        {
+                            using (var targetRowB = B.RowRange(i * 3, i * 3 + 3))
+                            {
+                                negT.CopyTo(targetRowB);
+                            }
                         }
                     }
                 }
 
-                // 5. 連立方程式を解く Ax = B
+                // 連立方程式を解く (SVD法)
                 var x = new Mat();
-                // Aは (3N, 6)、Bは (3N, 1) になっているはず
                 Cv2.Solve(A, B, x, DecompTypes.SVD);
 
-                // 6. 結果の取り出し（前半3つがオフセット）
-                Mat pivotOffset = x.RowRange(0, 3).Clone();
-
-                return pivotOffset;
+                // 結果の前半3つがオフセット座標
+                return x.RowRange(0, 3).Clone();
             }
         }
     }
