@@ -11,56 +11,61 @@ namespace ArucoPointer
 {
     public partial class Form1 : Form
     {
-        // === メンバ変数 ===
+        // ==========================================
+        // メンバ変数（状態管理）
+        // ==========================================
         List<Mat> collectedRvecs = new List<Mat>();
         List<Mat> collectedTvecs = new List<Mat>();
-        bool isCalibrating = false;
-        int collectCount = 0;
 
-        // ★計算された「先端のオフセット」
-        Mat calibratedOffset = null;
+        bool isCalibrating = false; // データ収集中か？
+        int collectCount = 0;       // 集めた数
+
+        Mat calibratedOffset = null; // ★計算された先端位置（ゴール）
+
+        // 自動開始用の変数
+        bool hasAutoCalibrated = false;
+        DateTime? detectionStartTime = null;
+
+        // 厳選収録用の変数
+        DateTime lastCollectTime = DateTime.MinValue;
+        Mat lastCollectedRvec = null;
 
         public Form1()
         {
             InitializeComponent();
+            // アプリ起動と同時にカメラ処理を開始
             Task.Run(() => CameraLoop());
         }
 
-        private void button1_Click(object sender, EventArgs e)
-        {
-            MessageBox.Show("カメラを起動します！");
-            Task.Run(() => CameraLoop());
-        }
-
-        private void button2_Click(object sender, EventArgs e)
-        {
-            // キャリブレーション開始
-            collectedRvecs.Clear();
-            collectedTvecs.Clear();
-            collectCount = 0;
-            isCalibrating = true;
-            MessageBox.Show("【先端位置の特定】\n先端を固定して、グリグリ回しながら20回撮影します。\nOKを押すと開始！");
-        }
-
+        // ==========================================
+        // メイン処理ループ
+        // ==========================================
         private void CameraLoop()
         {
-            // 仮のパラメータ（このままでOK）
-            float markerLength = 0.05f; // ★実際のマーカーサイズ(m)に合わせてね！
+            // ★設定：実際のマーカーサイズ(m)に合わせて変更してください
+            float markerLength = 0.0145f;
+
+            // カメラ内部パラメータ（仮定値）
             double fx = 600, cx = 320, cy = 240;
 
             using (var cameraMatrix = new Mat(3, 3, MatType.CV_64FC1))
             using (var distCoeffs = new Mat(5, 1, MatType.CV_64FC1, new Scalar(0)))
-            using (var capture = new VideoCapture(1)) // ★カメラ番号
+            using (var capture = new VideoCapture(1)) // ★カメラ番号（映らない場合は 0 に変更）
             {
-                // カメラ行列セット
+                // カメラ行列の初期化
                 cameraMatrix.Set<double>(0, 0, fx); cameraMatrix.Set<double>(0, 1, 0); cameraMatrix.Set<double>(0, 2, cx);
                 cameraMatrix.Set<double>(1, 0, 0); cameraMatrix.Set<double>(1, 1, fx); cameraMatrix.Set<double>(1, 2, cy);
                 cameraMatrix.Set<double>(2, 0, 0); cameraMatrix.Set<double>(2, 1, 0); cameraMatrix.Set<double>(2, 2, 1.0);
 
+                // 解像度指定 (iVCam等の高解像度対策)
                 capture.Set(VideoCaptureProperties.FrameWidth, 640);
                 capture.Set(VideoCaptureProperties.FrameHeight, 480);
 
-                if (!capture.IsOpened()) { MessageBox.Show("カメラが見つかりません！"); return; }
+                if (!capture.IsOpened())
+                {
+                    MessageBox.Show("カメラが見つかりません！");
+                    return;
+                }
 
                 using (var mat = new Mat())
                 {
@@ -78,75 +83,149 @@ namespace ArucoPointer
 
                             if (ids.Length > 0)
                             {
-                                // 枠と軸を描画
+                                // 枠線と軸の描画
                                 CvAruco.DrawDetectedMarkers(mat, corners, ids);
-
                                 using (var rvecs = new Mat())
                                 using (var tvecs = new Mat())
                                 {
                                     CvAruco.EstimatePoseSingleMarkers(corners, markerLength, cameraMatrix, distCoeffs, rvecs, tvecs);
 
-                                    // 検出されたすべてのマーカーに軸を描く
                                     for (int i = 0; i < ids.Length; i++)
                                     {
                                         Cv2.DrawFrameAxes(mat, cameraMatrix, distCoeffs, rvecs.Row(i), tvecs.Row(i), 0.1f);
                                     }
 
-                                    // --- 1. キャリブレーション中の処理 ---
+                                    // --------------------------------------------------
+                                    // 1. 自動キャリブレーション開始判定 (3秒カウントダウン)
+                                    // --------------------------------------------------
+                                    if (!hasAutoCalibrated && !isCalibrating)
+                                    {
+                                        if (detectionStartTime == null) detectionStartTime = DateTime.Now;
+
+                                        double remaining = 3.0 - (DateTime.Now - detectionStartTime.Value).TotalSeconds;
+
+                                        if (remaining > 0)
+                                        {
+                                            Cv2.PutText(mat, $"Auto Start in: {remaining:F1}s", new OpenCvSharp.Point(20, 400), HersheyFonts.HersheySimplex, 1.0, Scalar.Yellow, 2);
+                                        }
+                                        else
+                                        {
+                                            // 開始！
+                                            isCalibrating = true;
+                                            hasAutoCalibrated = true;
+                                            collectedRvecs.Clear();
+                                            collectedTvecs.Clear();
+                                            collectCount = 0;
+                                            lastCollectedRvec = null;
+                                        }
+                                    }
+
+                                    // --------------------------------------------------
+                                    // 2. データ収集 (厳選フィルタリング付き)
+                                    // --------------------------------------------------
                                     if (isCalibrating)
                                     {
-                                        // 0番目のマーカーを使って収集
-                                        using (var rRow = rvecs.Row(0)) using (var tRow = tvecs.Row(0))
+                                        using (var currentRvec = rvecs.Row(0))
                                         {
-                                            collectedRvecs.Add(rRow.Clone()); collectedTvecs.Add(tRow.Clone());
+                                            // 時間チェック(0.5秒) & 角度チェック(0.3以上変化)
+                                            bool isTimeOk = (DateTime.Now - lastCollectTime).TotalSeconds > 0.5;
+                                            double diff = 0;
+                                            bool isAngleOk = true;
+
+                                            if (lastCollectedRvec != null)
+                                            {
+                                                diff = Cv2.Norm(currentRvec, lastCollectedRvec, NormTypes.L2);
+                                                if (diff < 0.3) isAngleOk = false;
+                                            }
+
+                                            if (isTimeOk && isAngleOk)
+                                            {
+                                                // 採用！
+                                                using (var rRow = rvecs.Row(0)) using (var tRow = tvecs.Row(0))
+                                                {
+                                                    collectedRvecs.Add(rRow.Clone());
+                                                    collectedTvecs.Add(tRow.Clone());
+                                                }
+
+                                                if (lastCollectedRvec != null) lastCollectedRvec.Dispose();
+                                                lastCollectedRvec = currentRvec.Clone();
+                                                lastCollectTime = DateTime.Now;
+                                                collectCount++;
+
+                                                Cv2.PutText(mat, "Captured!", new OpenCvSharp.Point(20, 350), HersheyFonts.HersheySimplex, 1.0, Scalar.Yellow, 2);
+                                            }
+                                            else
+                                            {
+                                                string msg = isTimeOk ? $"Rotate More! (Diff: {diff:F2})" : "Wait...";
+                                                Cv2.PutText(mat, msg, new OpenCvSharp.Point(20, 350), HersheyFonts.HersheySimplex, 0.7, Scalar.Gray, 2);
+                                            }
                                         }
-                                        collectCount++;
+
+                                        Cv2.PutText(mat, $"Collecting... {collectCount}/20", new OpenCvSharp.Point(20, 400), HersheyFonts.HersheySimplex, 1.0, Scalar.Cyan, 2);
+
                                         if (collectCount >= 20)
                                         {
                                             isCalibrating = false;
+                                            if (lastCollectedRvec != null) { lastCollectedRvec.Dispose(); lastCollectedRvec = null; }
+
+                                            // 計算実行
                                             calibratedOffset = CalculatePivot(collectedRvecs, collectedTvecs);
-                                            MessageBox.Show("先端の位置を特定しました！\nこれで計測可能です。");
+                                            MessageBox.Show("キャリブレーション完了！\n先端トラッキングを開始します。");
                                         }
-                                        Thread.Sleep(100);
+                                        Thread.Sleep(10); // 短くてOK
                                     }
 
-                                    // --- 2. 計測モード（先端座標の表示） ---
+                                    // --------------------------------------------------
+                                    // 3. 計測モード (先端トラッキング)
+                                    // --------------------------------------------------
                                     if (calibratedOffset != null)
                                     {
-                                        // ポインター（リストの0番目にあるものと仮定）の先端位置を計算
                                         var tipPos = GetTipPosition(rvecs.Row(0), tvecs.Row(0), calibratedOffset);
-
                                         if (tipPos.HasValue)
                                         {
                                             var p = tipPos.Value;
 
-                                            // 画面に数値を表示 (カメラからの距離 X, Y, Z)
-                                            // X: 右方向, Y: 下方向, Z: 奥方向
+                                            // 座標表示
                                             string text = $"Tip: X={p.X:F3}, Y={p.Y:F3}, Z={p.Z:F3}";
                                             Cv2.PutText(mat, text, new OpenCvSharp.Point(10, 30), HersheyFonts.HersheySimplex, 0.8, Scalar.Lime, 2);
 
-                                            // 動作確認用に画面上に赤い点を打つ（計算が合ってるか確認用）
+                                            // 照準マーク表示
                                             var p2d = ProjectPoint(p, cameraMatrix, distCoeffs);
-                                            Cv2.Circle(mat, new Point((int)p2d.X, (int)p2d.Y), 5, Scalar.Red, -1);
+                                            Cv2.Circle(mat, new OpenCvSharp.Point((int)p2d.X, (int)p2d.Y), 6, Scalar.Red, -1);
+                                            Cv2.Circle(mat, new OpenCvSharp.Point((int)p2d.X, (int)p2d.Y), 10, Scalar.Yellow, 2);
                                         }
                                     }
                                 }
                             }
+                            else
+                            {
+                                // マーカーロスト時はカウントダウンリセット
+                                detectionStartTime = null;
+                            }
 
+                            // 画面更新
                             pictureBox1.Invoke((Action)(() => {
-                                var old = pictureBox1.Image; pictureBox1.Image = BitmapConverter.ToBitmap(mat); if (old != null) old.Dispose();
+                                var old = pictureBox1.Image;
+                                pictureBox1.Image = BitmapConverter.ToBitmap(mat);
+                                if (old != null) old.Dispose();
                             }));
                         }
-                        catch (Exception ex) { Console.WriteLine(ex.Message); }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Loop Error: " + ex.Message);
+                        }
+
                         Thread.Sleep(30);
                     }
                 }
             }
         }
 
-        // === 計算用メソッド（ここはずっと同じです） ===
+        // ==========================================
+        // 計算メソッド集
+        // ==========================================
 
-        // 先端オフセット算出
+        // ピボットキャリブレーション計算
         private Mat CalculatePivot(List<Mat> rvecs, List<Mat> tvecs)
         {
             int count = rvecs.Count;
@@ -181,21 +260,16 @@ namespace ArucoPointer
             }
         }
 
-        // 現在の先端位置を計算
-        // 現在の先端位置を計算
+        // 先端位置の計算
         private Point3d? GetTipPosition(Mat rvecRaw, Mat tvecRaw, Mat offset)
         {
-            using (var rvec = new Mat())
-            using (var tvec = new Mat())
-            using (var R = new Mat())
+            using (var rvec = new Mat()) using (var tvec = new Mat()) using (var R = new Mat())
             {
                 using (var rr = rvecRaw.Reshape(1)) rr.ConvertTo(rvec, MatType.CV_64FC1);
                 using (var tr = tvecRaw.Reshape(1)) tr.ConvertTo(tvec, MatType.CV_64FC1);
                 Cv2.Rodrigues(rvec, R);
 
-                // ★修正ポイント： offset.T() の .T() を削除しました！
-                // offsetはもともと縦長(3x1)なので、そのまま使わないと計算できません。
-                // 安全のため Clone() でコピーして使います。
+                // Offsetをコピーして使う（.T()は不要。offsetは元々3x1）
                 using (var P_offset = offset.Clone())
                 using (var R_P = (R * P_offset).ToMat())
                 using (var P_cam = (R_P + tvec.T().ToMat()).ToMat())
@@ -205,15 +279,25 @@ namespace ArucoPointer
             }
         }
 
-        // 3D点を2D画面に投影（赤い点用）
+        // 3D点 -> 2D画面投影（照準用）
         private Point2f ProjectPoint(Point3d p, Mat camMatrix, Mat dist)
         {
             var obj = new Mat(1, 1, MatType.CV_64FC3);
             obj.Set<Point3d>(0, 0, p);
             using (var imgPts = new Mat())
             {
-                Cv2.ProjectPoints(obj, new Mat(3, 1, MatType.CV_64FC1, new Scalar(0)), new Mat(3, 1, MatType.CV_64FC1, new Scalar(0)), camMatrix, dist, imgPts);
-                return imgPts.At<Point2f>(0);
+                // 正しいスカラー型の0を指定
+                Cv2.ProjectPoints(
+                    obj,
+                    new Mat(3, 1, MatType.CV_64FC1, new Scalar(0)),
+                    new Mat(3, 1, MatType.CV_64FC1, new Scalar(0)),
+                    camMatrix,
+                    dist,
+                    imgPts);
+
+                // Double型(Point2d)で取り出してからFloat(Point2f)に変換
+                Point2d p2d = imgPts.At<Point2d>(0);
+                return new Point2f((float)p2d.X, (float)p2d.Y);
             }
         }
     }
